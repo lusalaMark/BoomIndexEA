@@ -1,8 +1,8 @@
 //+------------------------------------------------------------------+
 //| Boom 500 Time-Close EA (HEDGING: OPEN MANY AT START + TP)         |
-//| Opens N positions immediately at start (same tick)                |
-//| Dynamic SL from market level (PERIOD_CURRENT) + TP (RR-based)     |
-//| Trailing SL (tighten only) + optional time close                  |
+//| IMPROVED: If PositionsToOpen > margin capacity, it auto-caps      |
+//| and opens the maximum possible positions instead of failing.      |
+//| Dynamic SL (PERIOD_CURRENT) + TP (RR-based) + trailing SL         |
 //+------------------------------------------------------------------+
 #property strict
 
@@ -18,8 +18,8 @@ enum TradeDirection
 
 input TradeDirection Direction        = DIR_SELL;          // Buy/Sell
 input string        TargetSymbol      = "Boom 500 Index";  // Exact Market Watch name
-input double        LotSize           = 0.10;              // Lot size per position
-input int           PositionsToOpen   = 2;                 // Number of positions to open immediately
+input double        LotSize           = 10;               // Lot size per position
+input int           PositionsToOpen   = 90;                 // Requested positions to open immediately
 input double        MarginSafetyPct   = 10.0;              // Keep % of free margin as buffer
 input ulong         MagicNumber       = 5002026;           // EA identifier
 
@@ -35,17 +35,20 @@ input bool   UseTrailingSL   = true;
 
 // --- Take Profit ---------------------------------------------------
 input bool   UseTakeProfit   = true;
-input double RiskReward      = 2.0;     // TP distance = risk * RR (risk from SL)
+input double RiskReward      = 2.0;
 
 // --- Order send robustness ----------------------------------------
-input int    MaxSendRetries       = 5;     // retries per position
-input int    RetryDelayMs         = 250;   // delay between retries
-input int    DeviationPoints      = 50;    // max price deviation (points)
+input int    MaxSendRetries  = 5;
+input int    RetryDelayMs    = 250;
+input int    DeviationPoints = 50;
 
 // -------------------- Internal state ------------------------------
 string g_symbol = "";
 bool   g_done_once = false;
 bool   g_opened_on_start = false;
+
+// NEW: actual positions EA will attempt to open (auto-capped)
+int    g_target_positions = 0;
 
 // -------------------- Helpers -------------------------------------
 bool EnsureSymbolSelected(const string sym)
@@ -63,7 +66,6 @@ bool IsHedgingAccount()
    return (AccountInfoInteger(ACCOUNT_MARGIN_MODE) == ACCOUNT_MARGIN_MODE_RETAIL_HEDGING);
 }
 
-// Count open positions for THIS EA on symbol (hedging-safe count)
 int CountMyPositions(const string sym)
 {
    int count = 0;
@@ -80,7 +82,6 @@ int CountMyPositions(const string sym)
    return count;
 }
 
-// Find the FIRST open position for THIS EA on symbol (used for timed close logic)
 bool GetMyFirstPosition(const string sym, ulong &ticket, datetime &pos_time)
 {
    for(int i=0; i<PositionsTotal(); i++)
@@ -99,7 +100,6 @@ bool GetMyFirstPosition(const string sym, ulong &ticket, datetime &pos_time)
    return false;
 }
 
-// Validate & normalize lots to broker rules for the symbol
 double NormalizeLots(const string sym, double requested)
 {
    double vmin  = SymbolInfoDouble(sym, SYMBOL_VOLUME_MIN);
@@ -114,14 +114,12 @@ double NormalizeLots(const string sym, double requested)
    return NormalizeDouble(lots, 2);
 }
 
-// Normalize price to symbol digits
 double NormalizePrice(const string sym, double price)
 {
    int digits = (int)SymbolInfoInteger(sym, SYMBOL_DIGITS);
    return NormalizeDouble(price, digits);
 }
 
-// Compute margin needed for 1 position, and max positions based on current free margin
 int CalcMaxPositionsByMargin(const string sym, double lots, TradeDirection dir, double safetyPct, double &margin_one)
 {
    margin_one = 0.0;
@@ -149,7 +147,6 @@ int CalcMaxPositionsByMargin(const string sym, double lots, TradeDirection dir, 
    return max_pos;
 }
 
-// --- Market level helpers on PERIOD_CURRENT (swing levels) ---------
 double GetSwingHigh(const string sym, int lookback)
 {
    double highs[];
@@ -180,13 +177,12 @@ double GetSwingLow(const string sym, int lookback)
    return l;
 }
 
-// Ensure SL respects broker minimum stop distance
 double EnforceStopsLevel(const string sym, TradeDirection dir, double sl)
 {
    if(sl <= 0.0) return 0.0;
 
    double point = SymbolInfoDouble(sym, SYMBOL_POINT);
-   int stops_level = (int)SymbolInfoInteger(sym, SYMBOL_TRADE_STOPS_LEVEL); // points
+   int stops_level = (int)SymbolInfoInteger(sym, SYMBOL_TRADE_STOPS_LEVEL);
    if(stops_level <= 0) return NormalizePrice(sym, sl);
 
    double min_dist = stops_level * point;
@@ -206,7 +202,6 @@ double EnforceStopsLevel(const string sym, TradeDirection dir, double sl)
    return NormalizePrice(sym, sl);
 }
 
-// Calculate dynamic SL for the CURRENT moment
 double CalcDynamicSL()
 {
    if(!UseDynamicSL) return 0.0;
@@ -230,7 +225,6 @@ double CalcDynamicSL()
    return sl;
 }
 
-// Calculate TP based on SL distance and RiskReward
 double CalcTakeProfit(double sl)
 {
    if(!UseTakeProfit) return 0.0;
@@ -238,7 +232,6 @@ double CalcTakeProfit(double sl)
 
    double bid = SymbolInfoDouble(g_symbol, SYMBOL_BID);
    double ask = SymbolInfoDouble(g_symbol, SYMBOL_ASK);
-
    double entry = (Direction == DIR_BUY ? ask : bid);
 
    double risk = 0.0;
@@ -260,7 +253,7 @@ double CalcTakeProfit(double sl)
    return NormalizePrice(g_symbol, tp);
 }
 
-// Send ONE order with retries (no delays between positions)
+// Send ONE order with retries
 bool SendOneOrder()
 {
    trade.SetExpertMagicNumber((long)MagicNumber);
@@ -273,8 +266,7 @@ bool SendOneOrder()
       return false;
    }
 
-   long trade_mode = SymbolInfoInteger(g_symbol, SYMBOL_TRADE_MODE);
-   if(trade_mode == SYMBOL_TRADE_MODE_DISABLED)
+   if(SymbolInfoInteger(g_symbol, SYMBOL_TRADE_MODE) == SYMBOL_TRADE_MODE_DISABLED)
    {
       Print("Trading disabled for symbol: ", g_symbol);
       return false;
@@ -282,7 +274,6 @@ bool SendOneOrder()
 
    double lots = NormalizeLots(g_symbol, LotSize);
 
-   // refresh tick
    MqlTick tick;
    if(!SymbolInfoTick(g_symbol, tick))
    {
@@ -290,7 +281,6 @@ bool SendOneOrder()
       return false;
    }
 
-   // compute SL/TP for this moment
    double sl = CalcDynamicSL();
    double tp = CalcTakeProfit(sl);
 
@@ -316,13 +306,10 @@ bool SendOneOrder()
 
       Print("Order FAILED. attempt=", attempt,
             " Retcode=", trade.ResultRetcode(),
-            " ", trade.ResultRetcodeDescription(),
-            " SL=", DoubleToString(sl, (int)SymbolInfoInteger(g_symbol, SYMBOL_DIGITS)),
-            " TP=", DoubleToString(tp, (int)SymbolInfoInteger(g_symbol, SYMBOL_DIGITS)));
+            " ", trade.ResultRetcodeDescription());
 
       Sleep(RetryDelayMs);
 
-      // refresh tick and recalc SL/TP before retry
       SymbolInfoTick(g_symbol, tick);
       sl = CalcDynamicSL();
       tp = CalcTakeProfit(sl);
@@ -331,7 +318,6 @@ bool SendOneOrder()
    return false;
 }
 
-// Close all positions for this EA on this symbol
 void CloseAllMyPositions(const string sym)
 {
    trade.SetExpertMagicNumber((long)MagicNumber);
@@ -356,7 +342,6 @@ void CloseAllMyPositions(const string sym)
    }
 }
 
-// Tighten dynamic SL over time (never loosen). TP stays fixed.
 void UpdateTrailingMarketSL()
 {
    if(!UseDynamicSL || !UseTrailingSL) return;
@@ -419,34 +404,38 @@ int OnInit()
    if(!EnsureSymbolSelected(g_symbol))
       return INIT_FAILED;
 
-   Print("ACCOUNT_MARGIN_MODE=", AccountInfoInteger(ACCOUNT_MARGIN_MODE),
-         " (Hedging expected = ", (long)ACCOUNT_MARGIN_MODE_RETAIL_HEDGING, ")");
-
    if(!IsHedgingAccount())
-      Alert("Warning: account is not hedging. Multiple positions per symbol may not work.");
+      Print("Warning: account is not hedging. Multiple positions per symbol may not work.");
 
-   // upfront margin capacity check
+   // Compute max positions and CAP target positions
    double lots = NormalizeLots(g_symbol, LotSize);
    double margin_one = 0.0;
    int max_pos = CalcMaxPositionsByMargin(g_symbol, lots, Direction, MarginSafetyPct, margin_one);
 
+   if(max_pos <= 0)
+   {
+      g_target_positions = 0;
+      Print("ERROR: Not enough margin to open even 1 position. Margin/pos=", DoubleToString(margin_one,2));
+   }
+   else
+   {
+      g_target_positions = PositionsToOpen;
+      if(g_target_positions > max_pos)
+      {
+         Print("INFO: Requested PositionsToOpen=", PositionsToOpen,
+               " but margin allows only MaxPositions=", max_pos,
+               ". EA will open ", max_pos, " positions.");
+         g_target_positions = max_pos;
+      }
+   }
+
    Print("EA init: FreeMargin=", DoubleToString(AccountInfoDouble(ACCOUNT_FREEMARGIN), 2),
          " Margin/pos=", DoubleToString(margin_one, 2),
          " MaxPositions=", max_pos,
-         " Requested=", PositionsToOpen);
-
-   if(PositionsToOpen <= 0) return INIT_FAILED;
-   if(max_pos <= 0) return INIT_FAILED;
-
-   if(PositionsToOpen > max_pos)
-   {
-      Alert("ERROR: Requested positions exceed margin capacity. MaxPositions=",
-            (string)max_pos, " Margin/pos=", DoubleToString(margin_one, 2));
-      return INIT_FAILED;
-   }
+         " Requested=", PositionsToOpen,
+         " TargetToOpen=", g_target_positions);
 
    EventSetTimer(TimerSeconds);
-
    return INIT_SUCCEEDED;
 }
 
@@ -455,15 +444,21 @@ void OnDeinit(const int reason)
    EventKillTimer();
 }
 
-// Open ALL required positions immediately when EA starts (first tick)
+// Bulk-open on first tick: opens as many as margin allows (g_target_positions)
 void OnTick()
 {
-   // only do the bulk-open once
    if(OneShot && g_done_once) return;
    if(g_opened_on_start) return;
 
+   if(g_target_positions <= 0)
+   {
+      g_opened_on_start = true;
+      if(OneShot) g_done_once = true;
+      return;
+   }
+
    int current = CountMyPositions(g_symbol);
-   int to_open = PositionsToOpen - current;
+   int to_open = g_target_positions - current;
    if(to_open <= 0)
    {
       g_opened_on_start = true;
@@ -471,19 +466,18 @@ void OnTick()
       return;
    }
 
-   // Open multiple positions NOW (same tick), without spacing
    for(int k=0; k<to_open; k++)
    {
-      // check margin each loop (margin changes after each order)
+      // Re-check margin live before each send (margin changes after each order)
       double lots = NormalizeLots(g_symbol, LotSize);
       double margin_one = 0.0;
-      int max_pos = CalcMaxPositionsByMargin(g_symbol, lots, Direction, MarginSafetyPct, margin_one);
+      int max_pos_now = CalcMaxPositionsByMargin(g_symbol, lots, Direction, MarginSafetyPct, margin_one);
       int cur = CountMyPositions(g_symbol);
 
-      if(cur >= max_pos)
+      if(cur >= max_pos_now)
       {
-         Print("ERROR: Margin limit reached while bulk-opening. Current=", cur,
-               " MaxByMargin=", max_pos,
+         Print("INFO: Margin limited during opening. Opened=", cur,
+               " MaxNow=", max_pos_now,
                " Margin/pos=", DoubleToString(margin_one,2));
          break;
       }
@@ -498,10 +492,8 @@ void OnTick()
 
 void OnTimer()
 {
-   // 1) trailing SL
    UpdateTrailingMarketSL();
 
-   // 2) time close
    if(CloseAfterMinutes <= 0) return;
 
    ulong ticket=0;
