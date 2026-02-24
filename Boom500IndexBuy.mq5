@@ -16,9 +16,9 @@ enum TradeDirection
    DIR_SELL = 1
 };
 
-input TradeDirection Direction        = DIR_SELL;          // Buy/Sell
+input TradeDirection Direction        = DIR_BUY;          // Buy/Sell
 input string        TargetSymbol      = "Boom 500 Index";  // Exact Market Watch name
-input double        LotSize           = 10;               // Lot size per position
+input double        LotSize           = 0.6;               // Lot size per position
 input int           PositionsToOpen   = 90;                 // Requested positions to open immediately
 input double        MarginSafetyPct   = 10.0;              // Keep % of free margin as buffer
 input ulong         MagicNumber       = 5002026;           // EA identifier
@@ -124,7 +124,7 @@ int CalcMaxPositionsByMargin(const string sym, double lots, TradeDirection dir, 
 {
    margin_one = 0.0;
 
-   double free_margin = AccountInfoDouble(ACCOUNT_FREEMARGIN);
+   double free_margin = AccountInfoDouble(ACCOUNT_MARGIN_FREE);
    if(free_margin <= 0) return 0;
 
    double usable = free_margin * (1.0 - safetyPct/100.0);
@@ -429,7 +429,7 @@ int OnInit()
       }
    }
 
-   Print("EA init: FreeMargin=", DoubleToString(AccountInfoDouble(ACCOUNT_FREEMARGIN), 2),
+   Print("EA init: FreeMargin=", DoubleToString(AccountInfoDouble(ACCOUNT_MARGIN_FREE), 2),
          " Margin/pos=", DoubleToString(margin_one, 2),
          " MaxPositions=", max_pos,
          " Requested=", PositionsToOpen,
